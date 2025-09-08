@@ -10,9 +10,8 @@ import yaml
 # --- Prerequisite Libraries ---
 # pip install opencv-python numpy pyyaml
 
-# --- Custom JSON Encoder for NumPy types ---
+# --- Custom JSON Encoder ---
 class NumpyEncoder(json.JSONEncoder):
-    """ Custom encoder for numpy data types """
     def default(self, obj):
         if isinstance(obj, np.integer): return int(obj)
         elif isinstance(obj, np.floating): return float(obj)
@@ -30,7 +29,6 @@ FINAL_CLASSES = [
 
 # --- Dataset Generation Class ---
 class DatasetGenerator:
-    """ Handles the creation of the COCO-style JSON annotation file. """
     def __init__(self, video_name, frame_size, all_classes):
         self.video_name = video_name
         self.width, self.height = frame_size
@@ -51,13 +49,53 @@ class DatasetGenerator:
 
 # --- Utility Functions ---
 def compute_tool_tip(mask, pupil_center):
-    """ Calculates the tip of a tool mask closest to the pupil's center. """
     if pupil_center is None or not np.any(mask): return None
     contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours: return None
     all_contour_points = np.vstack(contours)
     distances = np.linalg.norm(all_contour_points.squeeze(axis=1) - pupil_center, axis=1)
     return tuple(all_contour_points[np.argmin(distances)].squeeze().astype(int))
+
+# --- Integrated Standardization Function ---
+def standardize_coco_names(output_folder_path):
+    """Renames the folder, images, and JSON content to the final standard."""
+    print(f"  -> Standardizing names for {os.path.basename(output_folder_path)}...")
+    folder_name = os.path.basename(output_folder_path)
+    dataset_root = os.path.dirname(output_folder_path)
+    
+    parts = folder_name.split('_')
+    if len(parts) != 5:
+        print(f"  -> ✅ Already standardized. Skipping.")
+        return
+
+    # Create the new name by removing the third part
+    new_folder_name = f"{parts[0]}_{parts[1]}_{parts[3]}_{parts[4]}"
+    new_folder_path = os.path.join(dataset_root, new_folder_name)
+    
+    # Rename folder
+    os.rename(output_folder_path, new_folder_path)
+    
+    json_path = os.path.join(new_folder_path, "annotation.json")
+    if not os.path.exists(json_path): return
+
+    with open(json_path, 'r') as f: data = json.load(f)
+    
+    # Update JSON content
+    data['info']['description'] = f"Annotations for {new_folder_name}"
+    original_filenames = data['videos'][0]['file_names']
+    # MODIFIED: New filename format without '_frame_'
+    new_filenames = [f"{new_folder_name}_{os.path.basename(f)}" for f in original_filenames]
+    data['videos'][0]['file_names'] = new_filenames
+
+    with open(json_path, 'w') as f: json.dump(data, f, indent=4)
+    
+    # Rename image files
+    for original_fn, new_fn in zip(original_filenames, new_filenames):
+        old_image_path = os.path.join(new_folder_path, original_fn)
+        new_image_path = os.path.join(new_folder_path, new_fn)
+        if os.path.exists(old_image_path):
+            os.rename(old_image_path, new_image_path)
+    print(f"  -> ✅ Renamed folder, images, and JSON to '{new_folder_name}' standard.")
 
 # --- Main Processing Function ---
 def process_video_folder(video_folder_path):
@@ -77,7 +115,6 @@ def process_video_folder(video_folder_path):
 
     with open(yaml_path, 'r') as f: yaml_data = yaml.safe_load(f)
     class_map = {int(k): v for k, v in yaml_data['names'].items()}
-    # Standardize key class names to prevent typo issues
     if 1 in class_map: class_map[1] = "Cap-Cystotome"
     if 2 in class_map: class_map[2] = "Pupil"
 
@@ -99,10 +136,7 @@ def process_video_folder(video_folder_path):
                 class_name = class_map.get(class_id)
                 if not class_name: continue
                 poly_abs = (np.array(pts).reshape(-1, 2) * [w, h]).astype(np.int32)
-                # Create mask with correct data type for OpenCV
-                mask = np.zeros((h, w), dtype=np.uint8)
-                cv2.fillPoly(mask, [poly_abs], 1)
-                mask = mask.astype(bool) # Convert to bool for consistency
+                mask = np.zeros((h, w), dtype=np.uint8); cv2.fillPoly(mask, [poly_abs], 1); mask = mask.astype(bool)
                 all_frame_data[class_name][i] = {'seg': mask, 'bbox': cv2.boundingRect(poly_abs), 'area': np.sum(mask)}
 
     pupil_centers = [None] * num_frames
@@ -144,25 +178,33 @@ def process_video_folder(video_folder_path):
     
     dataset_generator.save_json(os.path.join(output_dir, "annotation.json"))
     
-    print(f"  -> Copying {num_frames} frames and creating dataset folder...")
+    print(f"  -> Copying {num_frames} frames...")
     for i, label_file in enumerate(label_files):
         base_name = os.path.splitext(os.path.basename(label_file))[0]
         src_img_path = glob.glob(os.path.join(images_dir, f"{base_name}.*"))[0]
         shutil.copy(src_img_path, os.path.join(output_dir, f"{i+1:06d}.jpg"))
 
-    print(f"  ✅ Successfully created COCO dataset for {video_name}.")
+    print(f"  -> Successfully created intermediate COCO dataset for {video_name}.")
+
+    # --- INTEGRATED FINAL STEP ---
+    standardize_coco_names(output_dir)
 
 def main():
     os.makedirs(DATASET_DIR, exist_ok=True)
-    print(f"🚀 Starting Step 3: Converting YOLO datasets to COCO format...")
+    print(f"🚀 Starting Step 3: Converting YOLO datasets to COCO and Standardizing Names...")
     
     video_folders = [f.path for f in os.scandir(VIDEO_BASE_DIR) if f.is_dir() and not f.name.startswith('.') and f.name not in [DATASET_DIR, 'Pupil Labels', 'visualized_videos']]
     
     for folder_path in sorted(video_folders):
         video_name = os.path.basename(folder_path)
-        if os.path.isdir(os.path.join(DATASET_DIR, video_name)):
-            print(f"\n--- Skipping COCO conversion for {video_name} (dataset already exists) ---")
-            continue
+        # Check if the FINAL standardized folder exists to skip
+        parts = video_name.split('_')
+        if len(parts) == 5:
+            final_name = f"{parts[0]}_{parts[1]}_{parts[3]}_{parts[4]}"
+            if os.path.isdir(os.path.join(DATASET_DIR, final_name)):
+                 print(f"\n--- Skipping {video_name} (final dataset already exists) ---")
+                 continue
+        
         process_video_folder(folder_path)
 
     print("\n✨ Step 3 Complete!")
